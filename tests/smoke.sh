@@ -25,6 +25,8 @@ echo "$out" | grep -q "STATUS: dry-run"
 echo "$out" | grep -q "THREAD:"
 prompt="$(echo "$out" | awk -F': ' '/^PROMPT:/{print $2; exit}')"
 grep -q "Ship." "$prompt"
+run="$(echo "$out" | awk -F': ' '/^RUN:/{print $2; exit}')"
+grep -q '"model": "cursor-grok-4.6-high"' "$PEERS_HOME/runs/$run/meta.json"
 
 # from Cursor, grok is yourself — must refuse
 set +e
