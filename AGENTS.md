@@ -1,7 +1,7 @@
 # AGENTS.md
 
 Public repo: **peers** — every coding plan you already pay for, one office.
-Python 3.9+, stdlib only. CLI entry: `peers` (alias `peer`).
+Python 3.9+, stdlib only. CLI: `peers`.
 
 ## Do
 

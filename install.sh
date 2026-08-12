@@ -49,8 +49,7 @@ cp -R "$HERE/dossiers" "$SHARE/dossiers"
 chmod +x "$SHARE/peers"
 
 ln -sfn "$SHARE/peers" "$BIN/peers"
-ln -sfn "$SHARE/peers" "$BIN/peer"
-rm -f "$BIN/grok46" "$BIN/opus-peer"
+rm -f "$BIN/peer" "$BIN/grok46" "$BIN/opus-peer"
 
 path_has_bin=0
 case ":$PATH:" in

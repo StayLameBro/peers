@@ -1375,7 +1375,6 @@ def cmd_setup() -> int:
         (pkg / "skills/agents/SKILL.md", home / ".agents/skills/delegate/SKILL.md"),
         (pkg / "skills/agents/SKILL.md", home / ".codex/skills/peers/SKILL.md"),
         (pkg / "commands/peers.md", home / ".claude/commands/peers.md"),
-        (pkg / "commands/peer.md", home / ".claude/commands/peer.md"),
     ]
     for src_p, dest in mapping:
         if not src_p.exists():
@@ -1397,15 +1396,18 @@ def cmd_setup() -> int:
     if grok_cmd.exists():
         grok_cmd.unlink()
         print(f"ok   removed {grok_cmd}")
+    peer_cmd = home / ".claude/commands/peer.md"
+    if peer_cmd.exists():
+        peer_cmd.unlink()
+        print(f"ok   removed {peer_cmd}")
     bin_dir.mkdir(parents=True, exist_ok=True)
     me = Path(__file__).resolve()
-    for name in ("peers", "peer"):
-        dest = bin_dir / name
-        if dest.is_symlink() or dest.exists():
-            dest.unlink()
-        dest.symlink_to(me)
-        print(f"ok   {dest} -> {me}")
-    for old in ("grok46", "opus-peer"):
+    dest = bin_dir / "peers"
+    if dest.is_symlink() or dest.exists():
+        dest.unlink()
+    dest.symlink_to(me)
+    print(f"ok   {dest} -> {me}")
+    for old in ("peer", "grok46", "opus-peer"):
         dest = bin_dir / old
         if dest.is_symlink() or dest.exists():
             dest.unlink()
