@@ -27,6 +27,27 @@ peers doctor
 
 `doctor` lists what's on PATH and who's actually signed in. It will not hang on "Press any key to sign in."
 
+## Login (peers has no account)
+
+If something says `STATUS: auth`, that CLI is not logged in. **This is not a peers bug.** Run the login in a **real terminal** (not an agent sandbox), then `peers doctor`.
+
+| CLI | Login |
+| --- | --- |
+| Cursor / Grok / Composer | `cursor-agent login` |
+| Claude / Opus / Sonnet | `claude auth login` |
+| Codex | `codex login` |
+| Gemini | `gemini` (follows its own login) |
+| OpenCode, Z.AI, Kimi, Ollama, … | `opencode /connect` |
+
+```bash
+cursor-agent login
+peers doctor
+```
+
+`cursor-agent status` prints **Starting login process...** even when you **are** logged in. That is Cursor's banner. `ok cursor … logged in` from `peers doctor` means you're in.
+
+If `STATUS: auth` and doctor already shows that CLI as `ok`: retry the **same** peer once. Don't hop to a different model. If doctor shows `AUTH`, run the login command above.
+
 ## Hook up a plan
 
 Three ways. Pick the lazy one.
@@ -101,7 +122,7 @@ One model has a local optimum. Other priors catch what the first compressed away
 - **Huddle is them reading each other.** Independent first. Then the thread.
 - **Never yourself.** Claude does not `peers opus`. Cursor does not `peers grok`. Codex does not `peers gpt`.
 - **Performance and efficiency.** Native subagents eat *your* usage — this session's tools, tiny parallel. Long work on another plan: `peers` (their quota). Lean-ins stay two lines so the prior helps instead of hindering.
-- **Never hang on login.** `STATUS: auth`. If that branch called in sick, don't keep pinging them.
+- **Never hang on login.** `STATUS: auth` is a real login prompt (`Press any key`). Cursor's status banner is not. If `peers doctor` still shows ok, retry that peer once.
 
 ## Commands
 

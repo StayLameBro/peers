@@ -11,7 +11,10 @@ Watch bash heartbeats. Read RESULT. Don't cat unless the memo is thin.
   peers huddle
   peers doctor
 
-If STATUS: auth or empty transcript, skip that peer.
+If STATUS: auth: peers has no account. `peers doctor`.
+If that peer is ok, retry it once (Cursor's "Starting login process" is a banner).
+If AUTH: run that CLI's login in a real terminal, then doctor, then retry.
+Don't substitute a different prior.
 
 ~~~bash
 peers $ARGUMENTS

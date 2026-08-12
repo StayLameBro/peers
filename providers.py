@@ -18,13 +18,16 @@ from pathlib import Path
 from typing import Callable
 
 AUTH_FAIL = re.compile(
-    r"press any key to sign in|starting login process|"
-    r"401|oauth access token has been revoked|not logged in|"
+    r"press any key to sign in|"
+    r"oauth access token has been revoked|"
+    r"not logged in|"
     r"please (?:log|sign) in|authentication required|"
-    r"loggedin\"?\s*:\s*false|unauthorized",
+    r"loggedin\"?\s*:\s*false|"
+    r"unauthorized",
     re.I,
 )
 AUTH_OK = re.compile(r"logged in|login successful|\"loggedin\"\s*:\s*true", re.I)
+CURSOR_LOGIN_CHATTER = re.compile(r"starting login process|authenticating with cursor", re.I)
 
 
 def which(name: str) -> str | None:
@@ -128,11 +131,21 @@ class Provider:
 
 
 def _quiet_env() -> dict[str, str]:
+    """Probes only. CI=1 so status doesn't wait on a TTY."""
     env = os.environ.copy()
     env["CI"] = "1"
     env["NO_COLOR"] = "1"
     env["TERM"] = "dumb"
     env["CLICOLOR"] = "0"
+    return env
+
+
+def _run_env() -> dict[str, str]:
+    """Real agent runs. Do not force CI=1 — Cursor then starts a fake login."""
+    env = os.environ.copy()
+    env["NO_COLOR"] = "1"
+    env["CLICOLOR"] = "0"
+    env.pop("CI", None)
     return env
 
 
@@ -213,18 +226,18 @@ def safe_read_path(
 
 def classify_auth(rc: int, stdout: str, stderr: str) -> tuple[str, str]:
     blob = f"{stdout}\n{stderr}"
+    if AUTH_OK.search(blob) and rc == 0:
+        return "ok", "logged in"
     if AUTH_FAIL.search(blob):
-        if "401" in blob or "revoked" in blob.lower():
+        if "revoked" in blob.lower() or re.search(r"401\s+oauth", blob, re.I):
             return "auth", "token revoked / 401 — re-login"
-        if "press any key" in blob.lower() or "starting login" in blob.lower():
+        if "press any key" in blob.lower():
             return "auth", "needs login (would hang on 'Press any key to sign in')"
         return "auth", "not authenticated"
     if rc == 142:
-        if AUTH_FAIL.search(blob) or "sign in" in blob.lower():
+        if "press any key" in blob.lower():
             return "auth", "login prompt (timed out — not hung)"
         return "timeout", "probe timed out"
-    if AUTH_OK.search(blob) and rc == 0:
-        return "ok", "logged in"
     if rc == 0:
         return "ok", "reachable"
     return "auth", (stderr or stdout).strip().splitlines()[-1][:120] if (stderr or stdout).strip() else f"exit {rc}"
@@ -330,14 +343,16 @@ def _parse_claude_probe(rc: int, stdout: str, stderr: str) -> tuple[str, str]:
 
 
 def _parse_cursor_probe(rc: int, stdout: str, stderr: str) -> tuple[str, str]:
+    """`cursor-agent status` always prints 'Starting login process' even when logged in."""
     blob = f"{stdout}\n{stderr}"
-    if "press any key" in blob.lower() or "starting login process" in blob.lower():
-        if "logged in" in blob.lower() and "press any key" not in blob.lower():
-            return "ok", "logged in"
-        # status sometimes prints "Starting login" even when it then succeeds
-        if re.search(r"✓\s*login successful|logged in", blob, re.I) and rc == 0:
-            return "ok", "logged in"
+    if AUTH_OK.search(blob):
+        return "ok", "logged in"
+    if "press any key" in blob.lower():
         return "auth", "needs login — cursor-agent login"
+    if rc == 142:
+        return "timeout", "cursor-agent status timed out — retry"
+    if rc == 0:
+        return "ok", "reachable"
     return classify_auth(rc, stdout, stderr)
 
 
@@ -577,11 +592,23 @@ def probe(prov: Provider, *, force: bool = False) -> tuple[str, str]:
         result = ("ok", bin)
         _probe_cache[prov.id] = result
         return result
-    rc, out, err = run_quiet(argv, timeout=8)
+    rc, out, err = run_quiet(argv, timeout=12 if prov.id == "cursor" else 8)
     parser = prov.parse_probe or classify_auth
     state, detail = parser(rc, out, err)
+    chatter = CURSOR_LOGIN_CHATTER.search(f"{out}\n{err}")
+    if (
+        prov.id == "cursor"
+        and state in ("auth", "timeout")
+        and "press any key" not in f"{out}\n{err}".lower()
+    ):
+        rc, out, err = run_quiet(argv, timeout=12)
+        state, detail = parser(rc, out, err)
+        chatter = CURSOR_LOGIN_CHATTER.search(f"{out}\n{err}")
     if state == "ok":
         detail = f"{bin}  {detail}".strip()
+    elif prov.id == "cursor" and state == "timeout" and chatter:
+        # Status hung on its own banner. Don't block the real -p run.
+        state, detail = "ok", f"{bin}  status timed out (chatty login banner)"
     result = (state, detail)
     _probe_cache[prov.id] = result
     return result

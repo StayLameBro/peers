@@ -32,7 +32,12 @@ peers thread
 | Deep research, several slices | `peers research` |
 | Same question, several priors | `peers both --with a,b,c` |
 | Different jobs | `peers parallel` |
-| Login / 401 | `peers doctor` — do not retry |
+| Login / 401 | `peers doctor`. If ok, retry the same peer once. If AUTH, that CLI's login in a real terminal (`cursor-agent login` / `claude auth login`), then doctor. Don't substitute another prior. |
 
 Never `peers opus` / `peers claude` / `peers sonnet`. After a desk run, huddle.
-`STATUS: auth` or an empty transcript means that branch is out — skip it.
+`STATUS: auth`: peers has no account. Run `peers doctor`.
+If that CLI is `ok`, retry the **same** peer once — Cursor's status banner
+("Starting login process") is not a logout. If doctor shows `AUTH`, run that
+CLI's login in a real terminal (`cursor-agent login`, `claude auth login`, …),
+then doctor, then retry. Don't swap in a different prior.
+
