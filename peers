@@ -70,6 +70,7 @@ Long work on another plan: peers. Don't pay twice.
 Lean-in is leverage, not a costume — priors stay two lines.
 
 OpenCode /connect → that provider works here. Or: peers zai/glm-4.6
+OpenCode runs share one serve when attached. Claude/Cursor/Codex/Gemini are one-shot.
 """
 
 ROLES = {
@@ -810,6 +811,11 @@ def run_target(args: argparse.Namespace, task: str, *, silent: bool = False) -> 
         + "\n",
     )
     if args.dry_run:
+        bin_name = prov.find() or (prov.bins[0] if prov.bins else prov.id)
+        argv = prov.argv(bin_name, model, prompt, args.force, args.agent)
+        if prov.id == "opencode":
+            argv = P.attach_opencode_dir(argv, work_cwd)
+        extra["ARGV"] = " ".join(argv[:-1]) if argv else ""
         write(
             run_dir / "result.md",
             "## RESULT\nSTATUS: dry-run\nSUMMARY: prompt written, not executed\n"
@@ -835,7 +841,13 @@ def run_target(args: argparse.Namespace, task: str, *, silent: bool = False) -> 
             print_card(run_dir, "auth", {**extra, "FIX": prov.login})
         return 1, run_dir, "auth"
 
+    if prov.id == "opencode":
+        url = P.ensure_opencode_gateway(bin)
+        if url:
+            extra["ATTACH"] = url
     argv = prov.argv(bin, model, prompt, args.force, args.agent)
+    if prov.id == "opencode":
+        argv = P.attach_opencode_dir(argv, work_cwd)
     timeout = args.timeout or prov.timeout
     extra["LIVE"] = str(run_dir / "transcript.md")
     extra["TAIL"] = str(run_dir / "live.md")
@@ -1306,6 +1318,9 @@ def cmd_doctor() -> int:
         print("desk       " + ("+".join(desk) if desk else "(need an authenticated peer)"))
     if oc_ok:
         print("gateway    opencode /connect  →  peers zai | kimi | ollama | provider/model")
+        attached = P.discover_opencode_url()
+        hint = f"  {attached}" if attached else ""
+        print(f"           OpenCode runs share one serve when attached.{hint}")
     if missing_backend:
         print(f"{PROG}: no coding CLI on PATH. Install one, or: opencode /connect", file=sys.stderr)
         return 3

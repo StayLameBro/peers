@@ -7,6 +7,7 @@ rm -rf "$PEERS_HOME"
 mkdir -p "$PEERS_HOME"
 python3 -m py_compile peers providers.py dossiers.py
 python3 peers | grep -q "one office"
+python3 peers | grep -q "share one serve"
 python3 peers version | grep -q "peers 0.3"
 python3 tests/test_providers.py
 
@@ -56,6 +57,23 @@ echo "$out" | grep -q "dry-run"
 out="$(PEERS_CALLER=cursor python3 peers both --with grok,opus --dry-run --cwd "$HERE" "hard call")"
 echo "$out" | grep -q "NATIVE:"
 echo "$out" | grep -q "opus"
+
+# OpenCode attach is configured via env — smoke must not need a live serve
+out="$(PEERS_OPENCODE_URL=http://127.0.0.1:4096 python3 peers zai --dry-run --cwd "$HERE" "noop task")"
+echo "$out" | grep -q "STATUS: dry-run"
+echo "$out" | grep -q -- "--attach"
+echo "$out" | grep -q "http://127.0.0.1:4096"
+out="$(python3 peers zai --dry-run --cwd "$HERE" "noop task")"
+echo "$out" | grep -q "STATUS: dry-run"
+if echo "$out" | grep -q -- "--attach"; then
+  echo "fail: dry-run attached without a configured gateway" >&2
+  exit 1
+fi
+out="$(python3 peers opus --dry-run --cwd "$HERE" "noop task")"
+if echo "$out" | grep -q -- "--attach"; then
+  echo "fail: Claude dry-run must stay one-shot" >&2
+  exit 1
+fi
 
 python3 peers note --cwd "$HERE" "smoke note from tests"
 

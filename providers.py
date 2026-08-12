@@ -6,16 +6,27 @@ sit on "Press any key to sign in". Callers must not invoke themselves.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
+import time
+import urllib.error
+import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
+
+try:
+    import fcntl
+except ImportError:  # Windows later; flock is Unix/macOS
+    fcntl = None  # type: ignore[assignment]
 
 AUTH_FAIL = re.compile(
     r"press any key to sign in|starting login process|"
@@ -252,8 +263,316 @@ def _claude_argv(bin: str, model: str, prompt: str, force: bool, role: str) -> l
     return args
 
 
+# OpenCode is the only CLI that can share a process: one `opencode serve`,
+# many `opencode run --attach`. Claude, Cursor, Codex, and Gemini are one-shot.
+_OPENCODE_URL_OK = re.compile(r"^https?://[A-Za-z0-9.[\]:_-]+$")
+_opencode_lock = threading.RLock()
+_opencode_cached_url: str | None = None
+
+
+def desk_home() -> Path:
+    """Same default as the CLI: PEERS_HOME or ~/.local/share/peers/desk."""
+    if os.environ.get("PEERS_HOME"):
+        return Path(os.environ["PEERS_HOME"])
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".local/share"
+    return base / "peers" / "desk"
+
+
+def opencode_state_path() -> Path:
+    """Pid/url file under the desk dir — never the git checkout, never /tmp/peers."""
+    return desk_home() / "opencode-serve.json"
+
+
+def reset_opencode_gateway() -> None:
+    global _opencode_cached_url
+    with _opencode_lock:
+        _opencode_cached_url = None
+
+
+def _set_opencode_cache(url: str | None) -> None:
+    global _opencode_cached_url
+    _opencode_cached_url = url
+
+
+def _serve_host() -> str:
+    return (
+        os.environ.get("PEERS_OPENCODE_HOST")
+        or os.environ.get("OPENCODE_SERVER_HOSTNAME")
+        or "127.0.0.1"
+    ).strip() or "127.0.0.1"
+
+
+def _attach_host(bind_host: str) -> str:
+    if bind_host in ("0.0.0.0", "::", "[::]"):
+        return "127.0.0.1"
+    return bind_host
+
+
+def _configured_port() -> int | None:
+    for key in ("PEERS_OPENCODE_PORT", "OPENCODE_SERVER_PORT"):
+        raw = (os.environ.get(key) or "").strip()
+        if raw.isdigit():
+            n = int(raw)
+            if 1 <= n <= 65535:
+                return n
+    return None
+
+
+def _normalize_attach_url(raw: str | None) -> str | None:
+    raw = (raw or "").strip().rstrip("/")
+    if not raw or raw.lower() in ("0", "off", "none", "false"):
+        return None
+    if "://" not in raw and re.match(r"^(127\.0\.0\.1|localhost|\[::1\]):\d+$", raw):
+        raw = "http://" + raw
+    if "@" in raw or not _OPENCODE_URL_OK.match(raw):
+        return None
+    return raw
+
+
+def _env_attach_url() -> str | None:
+    for key in ("PEERS_OPENCODE_URL", "OPENCODE_SERVER_URL"):
+        url = _normalize_attach_url(os.environ.get(key))
+        if url:
+            return url
+    return None
+
+
+def _pid_alive(pid: int) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _opencode_healthy(url: str, timeout: float = 0.5) -> bool:
+    """GET /global/health. 401 still counts — password-protected OpenCode."""
+    health = url.rstrip("/") + "/global/health"
+    req = urllib.request.Request(health, method="GET")
+    password = os.environ.get("OPENCODE_SERVER_PASSWORD") or ""
+    if password:
+        user = os.environ.get("OPENCODE_SERVER_USERNAME") or "opencode"
+        token = base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
+        req.add_header("Authorization", f"Basic {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if getattr(resp, "status", 200) != 200:
+                return False
+            body = resp.read(256)
+            if not body:
+                return True
+            try:
+                data = json.loads(body.decode("utf-8", "replace"))
+            except json.JSONDecodeError:
+                return True
+            return data.get("healthy", True) is not False
+    except urllib.error.HTTPError as e:
+        return e.code in (401, 403)
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def _read_state() -> dict:
+    path = opencode_state_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_state(*, url: str, pid: int | None, owned: bool) -> None:
+    path = opencode_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"url": url, "owned": bool(owned)}
+    if pid:
+        payload["pid"] = int(pid)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _drop_state() -> None:
+    path = opencode_state_path()
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _url_from_state() -> str | None:
+    data = _read_state()
+    url = _normalize_attach_url(str(data.get("url") or ""))
+    if not url:
+        return None
+    pid = data.get("pid")
+    if isinstance(pid, int) and pid > 0 and not _pid_alive(pid):
+        _drop_state()
+        return None
+    if _opencode_healthy(url):
+        return url
+    if isinstance(pid, int) and pid > 0 and _pid_alive(pid):
+        return None
+    _drop_state()
+    return None
+
+
+@contextmanager
+def _state_lock() -> Iterator[None]:
+    path = opencode_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lockp = path.with_name(path.name + ".lock")
+    fh = open(lockp, "a+")
+    try:
+        if fcntl is not None:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if fcntl is not None:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        fh.close()
+
+
+def _port_listening(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
+def _free_port(host: str) -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host if host not in ("0.0.0.0", "::") else "127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def _default_probe_url() -> str:
+    host = _attach_host(_serve_host())
+    port = _configured_port() or 4096
+    return f"http://{host}:{port}"
+
+
+def discover_opencode_url(*, probe_default: bool = False) -> str | None:
+    """Env or live desk state. No process start. Safe for dry-run / tests."""
+    env = _env_attach_url()
+    if env:
+        return env
+    with _opencode_lock:
+        cached = _opencode_cached_url
+    if cached and _opencode_healthy(cached):
+        return cached
+    url = _url_from_state()
+    if url:
+        with _opencode_lock:
+            _set_opencode_cache(url)
+        return url
+    if probe_default:
+        guess = _default_probe_url()
+        if _opencode_healthy(guess):
+            _write_state(url=guess, pid=None, owned=False)
+            with _opencode_lock:
+                _set_opencode_cache(guess)
+            return guess
+    return None
+
+
+def _start_opencode_serve(bin: str) -> str | None:
+    bind = _serve_host()
+    host = bind if bind not in ("0.0.0.0", "::") else "127.0.0.1"
+    port = _configured_port()
+    if port is None:
+        port = 4096 if not _port_listening(host, 4096) else _free_port(host)
+    url = f"http://{_attach_host(bind)}:{port}"
+    home = desk_home()
+    home.mkdir(parents=True, exist_ok=True)
+    log_path = home / "opencode-serve.log"
+    env = os.environ.copy()
+    env["NO_COLOR"] = "1"
+    env["CLICOLOR"] = "0"
+    try:
+        log_fh = open(log_path, "a", encoding="utf-8")
+    except OSError:
+        log_fh = subprocess.DEVNULL
+    try:
+        proc = subprocess.Popen(
+            [bin, "serve", "--hostname", bind, "--port", str(port)],
+            cwd=str(home),
+            stdin=subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=env,
+        )
+    except OSError:
+        return None
+    finally:
+        if log_fh is not subprocess.DEVNULL:
+            try:
+                log_fh.close()
+            except OSError:
+                pass
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return None
+        if _opencode_healthy(url):
+            _write_state(url=url, pid=proc.pid, owned=True)
+            _set_opencode_cache(url)
+            return url
+        time.sleep(0.15)
+    if proc.poll() is None:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    return None
+
+
+def ensure_opencode_gateway(bin: str) -> str | None:
+    """Reuse a running serve, or start one. Shared across jobs and peers invocations."""
+    url = discover_opencode_url(probe_default=True)
+    if url:
+        return url
+    if not bin:
+        return None
+    with _opencode_lock:
+        url = discover_opencode_url(probe_default=True)
+        if url:
+            return url
+        with _state_lock():
+            url = discover_opencode_url(probe_default=True)
+            if url:
+                return url
+            return _start_opencode_serve(bin)
+
+
+def attach_opencode_dir(argv: list[str], cwd: Path | str) -> list[str]:
+    """Point an attached `opencode run` at this job's project. No-op without --attach."""
+    if "--attach" not in argv or "--dir" in argv or not argv:
+        return argv
+    return argv[:-1] + ["--dir", str(Path(cwd).resolve()), argv[-1]]
+
+
 def _opencode_argv(bin: str, model: str, prompt: str, force: bool, role: str) -> list[str]:
     args = [bin, "run"]
+    url = discover_opencode_url()
+    if url:
+        args += ["--attach", url]
     if model:
         args += ["-m", model]
     args.append(prompt)

@@ -45,6 +45,8 @@ peers moonshot/kimi-k2.5   # any OpenCode provider/model id
 
 API keys stay in that CLI. peers never asks for them.
 
+OpenCode-backed runs share one `opencode serve` (MCP stays warm). Claude, Cursor, Codex, and Gemini are one-shot.
+
 **3. A CLI we haven't heard of.** `~/.config/peers/config.json` — bin path + argv template. See `examples/config.json`.
 
 | You logged into | Then |
