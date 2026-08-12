@@ -10,13 +10,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: compile
-        run: python3 -m py_compile peer
-      - name: cheatsheet
-        run: python3 peer | grep -q "two senior models"
-      - name: version
-        run: python3 peer version | grep -q peerdesk
-      - name: dry-run auto-thread
+      - name: no live desk in git
         run: |
-          python3 peer grok --dry-run --cwd "$PWD" "noop"
-          python3 peer grok --dry-run --cwd "$PWD" "second" | grep -q THREAD
+          if git ls-files | grep -E '(^|/)(observed\.md|transcript\.md|handoff\.md|live\.md)$|/(runs|threads)/|\.jsonl$'; then
+            echo "live desk/transcript files must not be committed" >&2
+            exit 1
+          fi
+      - name: smoke
+        run: bash tests/smoke.sh

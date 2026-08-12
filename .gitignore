@@ -4,3 +4,26 @@ __pycache__/
 .venv/
 dist/
 *.egg-info/
+
+# live desk — transcripts, memos, runs (never commit)
+tests/.desk/
+.desk/
+observed.md
+**/observed.md
+**/handoff.md
+**/transcript.md
+**/live.md
+**/stderr.log
+**/prompt.md
+LAST
+
+# local secrets and editor dumps
+.env
+.env.*
+*.pem
+credentials.json
+*.jsonl
+agent-transcripts/
+
+# accidental local config (the template is examples/config.json)
+/config.json

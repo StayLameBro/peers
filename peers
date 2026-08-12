@@ -1,0 +1,1543 @@
+#!/usr/bin/env python3
+"""peers — every coding plan you already pay for. One office.
+
+Cheap default: RESULT memos + paths.
+The other branch heartbeats into this session — no GUI, no extra commands.
+Never call yourself. Never hang on a login prompt.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from queue import Empty, Queue
+
+PACKAGE = Path(__file__).resolve().parent
+sys.path.insert(0, str(PACKAGE))
+import dossiers as D  # noqa: E402
+import providers as P  # noqa: E402
+
+VERSION = "0.3.0"
+
+
+def _default_home() -> Path:
+    if os.environ.get("PEERS_HOME"):
+        return Path(os.environ["PEERS_HOME"])
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".local/share"
+    return base / "peers" / "desk"
+
+
+ROOT = _default_home()
+RUNS = ROOT / "runs"
+THREADS = ROOT / "threads"
+LAST = ROOT / "LAST"
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+RESULT_RE = re.compile(r"^## RESULT\s*$", re.M)
+STATUS_RE = re.compile(r"^STATUS:\s*(\S+)", re.M)
+INLINE_LIMIT = 12_000
+PROG = "peers"
+
+GUIDE = """
+peers — every coding plan you already pay for. one office.
+
+  peers auto "task"              the peer who's good at this (not you)
+  peers grok "task"              Cursor — skip if you already are Cursor
+  peers opus "task"              Claude — skip if you already are Claude
+  peers research "question"      several peers, different slices, go deep
+  peers both --with opus,codex,gemini "q"   same question; names from peers providers
+  peers huddle                   they read each other
+  peers note "my take"           your memo. don't hire a second you.
+
+  peers providers                what's on PATH
+  peers doctor                   logins (won't hang)
+  peers setup                    skills + shims
+
+Same repo, same thread. A dropdown is for you. This is for the agent.
+Identity theft is not a joke: native Task for your own model.
+Heartbeats print here. Read RESULT. Open LIVE only if the memo is thin.
+Native subagents: this session's tools, tiny parallel.
+Long work on another plan: peers. Don't pay twice.
+Lean-in is leverage, not a costume — priors stay two lines.
+
+OpenCode /connect → that provider works here. Or: peers zai/glm-4.6
+"""
+
+ROLES = {
+    "worker": (
+        "Peer implementer. Read before editing. Use your prior. "
+        "Tight prose, no preamble, no costume."
+    ),
+    "research": (
+        "Peer researcher. Go as deep as the question needs. Cite URLs. "
+        "Quote claims that matter. Do not edit files. Do not pad. "
+        "Do not stop at a vibe."
+    ),
+    "review": (
+        "Peer reviewer. Catch mistakes, missing edge cases, wrong assumptions. "
+        "Cite file:line. Do not edit unless asked to fix."
+    ),
+    "consult": (
+        "Peer. Independent take. Disagree when you would disagree. No file edits."
+    ),
+}
+
+CONTRACT = """You are sharing a desk with other peers on other coding plans.
+Work as a colleague: if a RESULT card is too compressed, Read the TRANSCRIPT path before deciding. Do not guess what they tried. Do not ask the human to paste it.
+
+Do not invoke the `peers` CLI (or your own product CLI) to call yourself. Native tools only for your own model. Colleagues already left RESULT/TRANSCRIPT paths on this thread.
+
+A short lean-in below is permission to use your prior — leverage, not a personality. Do not roleplay. If a counterpart dossier path is given, Read it only when you need how they actually fail.
+
+End with exactly this block and nothing after it:
+## RESULT
+STATUS: done | blocked | needs-decision
+SUMMARY: up to 8 short lines
+FILES: comma-separated paths, or none
+VERIFY: command, or n/a
+DECISION: one question, or none
+DISAGREE: your pushback, or none"""
+
+RESEARCH_CONTRACT = """You are researching for a desk of peers on other coding plans.
+Go as deep as the question needs. Cite URLs. Quote claims that matter. Do not edit files. Do not pad. Do not perform a personality. Do not call yourself.
+
+If a RESULT card on this thread is thin, Read the TRANSCRIPT. Do not guess.
+
+End with exactly this block and nothing after it:
+## RESULT
+STATUS: done | blocked | needs-decision
+SUMMARY: findings — depth over brevity, still no preamble
+SOURCES: comma-separated URLs, or none
+FILES: none
+VERIFY: n/a
+DECISION: one question, or none
+DISAGREE: pushback on the obvious answer, or none"""
+
+AGENTS = tuple(ROLES)
+COMMANDS = {
+    "both", "huddle", "parallel", "auto", "research", "doctor", "setup", "providers",
+    "version", "last", "ls", "show", "cat", "thread", "note", "help",
+}
+HUDDLE_TASK = (
+    "Read every peer's RESULT and TRANSCRIPT on this thread. "
+    "Say what you agree with, what you disagree with, and why. "
+    "Use their strengths; don't rewrite their memo as a costume. "
+    "If the next step is obvious and in your role, take it; otherwise stop at DECISION."
+)
+POOL = 4
+
+
+def die(msg: str, code: int = 3) -> None:
+    print(f"{PROG}: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+_BIN_OK = re.compile(r"^/[A-Za-z0-9._/-]+$")
+
+
+def peers_bin_dir() -> Path:
+    raw = os.environ.get("PEERS_BIN") or str(Path.home() / ".local/bin")
+    p = Path(raw).expanduser()
+    if not p.is_absolute() or not _BIN_OK.match(str(p)):
+        die("PEERS_BIN must be an absolute path (letters, digits, . _ - /)")
+    return p
+
+
+def _refuse_checkout_desk(root: Path) -> None:
+    """Live transcripts must not land in the public git checkout."""
+    pkg = PACKAGE.resolve()
+    git = pkg / ".git"
+    if not git.is_dir() and not git.is_file():
+        return
+    try:
+        rel = root.resolve().relative_to(pkg)
+    except ValueError:
+        return
+    if rel.parts and rel.parts[0] == "tests":
+        return
+    die(
+        f"PEERS_HOME is inside the peers git checkout ({root}).\n"
+        "  That would commit transcripts. Unset PEERS_HOME "
+        "(default is ~/.local/share/peers/desk).\n"
+        "  Tests: export PEERS_HOME to a path under tests/"
+    )
+
+
+def ensure_desk() -> None:
+    _refuse_checkout_desk(ROOT)
+    for d in (ROOT, RUNS, THREADS):
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
+
+
+def which(name: str) -> str | None:
+    return shutil.which(name)
+
+
+def strip_ansi(text: str) -> str:
+    text = ANSI.sub("", text)
+    lines = [
+        ln
+        for ln in text.splitlines()
+        if ln.strip() and not ln.strip().startswith(("> build", "> "))
+    ]
+    return "\n".join(lines).strip() + "\n"
+
+
+def write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    path.write_text(text, encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def read(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+
+
+def slug(name: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9_-]+", "-", name).strip("-")
+    return s[:48] or "thread"
+
+
+def auto_thread(cwd: Path) -> str:
+    git = which("git")
+    if git:
+        p = subprocess.run(
+            [git, "rev-parse", "--show-toplevel"],
+            cwd=cwd, capture_output=True, text=True, timeout=5,
+        )
+        if p.returncode == 0 and p.stdout.strip():
+            return slug(Path(p.stdout.strip()).name)
+    return slug(cwd.name) or "desk"
+
+
+def apply_thread(args: argparse.Namespace, cwd: Path) -> None:
+    ns_defaults(args)
+    if getattr(args, "no_thread", False):
+        args.thread = None
+        return
+    args.thread = slug(args.thread) if args.thread else auto_thread(cwd)
+
+
+def repo_snapshot(cwd: Path) -> str:
+    lines = [f"cwd: {cwd}"]
+    git = which("git")
+    if not git:
+        return "\n".join(lines)
+
+    def git_out(*a: str) -> str:
+        p = subprocess.run([git, *a], cwd=cwd, capture_output=True, text=True, timeout=8)
+        return p.stdout.strip() if p.returncode == 0 else ""
+
+    branch = git_out("rev-parse", "--abbrev-ref", "HEAD")
+    if branch:
+        lines.append(f"branch: {branch}")
+    dirty = git_out("diff", "--name-only", "HEAD")
+    names = [n for n in dirty.splitlines() if n][:20]
+    if names:
+        lines.append("dirty: " + ", ".join(names))
+        if len(dirty.splitlines()) > 20:
+            lines.append("dirty: (truncated at 20 names; no diffs)")
+    return "\n".join(lines)
+
+
+def extract_result(transcript: str) -> tuple[str, str]:
+    m = RESULT_RE.search(transcript)
+    if m:
+        block = transcript[m.start() :].strip() + "\n"
+        sm = STATUS_RE.search(block)
+        status = (sm.group(1) if sm else "unknown").lower().rstrip(",")
+        return block, status
+    tail = "\n".join(transcript.strip().splitlines()[-20:])
+    block = (
+        "## RESULT\nSTATUS: unknown\n"
+        "SUMMARY: (no RESULT card; last 20 transcript lines)\n"
+        f"{tail}\nFILES: none\nVERIFY: n/a\nDECISION: none\nDISAGREE: none\n"
+    )
+    return block, "unknown"
+
+
+def new_run(name: str) -> Path:
+    ensure_desk()
+    rid = f"{int(time.time())}-{os.getpid()}-{slug(name)}"
+    d = RUNS / rid
+    d.mkdir(parents=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    write(LAST, str(d) + "\n")
+    return d
+
+
+def print_card(run_dir: Path, status: str, extra: dict[str, str] | None = None) -> None:
+    lines = [
+        f"STATUS: {status}",
+        f"RESULT: {run_dir / 'result.md'}",
+        f"TRANSCRIPT: {run_dir / 'transcript.md'}",
+        f"PROMPT: {run_dir / 'prompt.md'}",
+        f"LOG: {run_dir / 'stderr.log'}",
+        f"RUN: {run_dir.name}",
+    ]
+    if extra:
+        for k, v in extra.items():
+            lines.append(f"{k}: {v}")
+    print("\n".join(lines))
+
+
+def thread_dir(name: str) -> Path:
+    ensure_desk()
+    d = THREADS / slug(name)
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    idx = d / "runs.json"
+    if not idx.exists():
+        write(idx, "[]\n")
+    return d
+
+
+def load_thread(name: str) -> list[dict]:
+    return json.loads(read(thread_dir(name) / "runs.json") or "[]")
+
+
+def save_thread(name: str, entries: list[dict]) -> None:
+    d = thread_dir(name)
+    write(d / "runs.json", json.dumps(entries, indent=2) + "\n")
+    lines = [f"# thread {slug(name)}", ""]
+    handoff = d / "handoff.md"
+    if handoff.exists():
+        lines += ["## caller notes", read(handoff).strip(), ""]
+    lines += ["| # | who | role | status | result | transcript |", "|---|---|---|---|---|---|"]
+    for i, e in enumerate(entries, 1):
+        rd = Path(e["dir"])
+        lines.append(
+            f"| {i} | {e.get('target','')} | {e.get('agent','')} | {e.get('status','')} "
+            f"| `{rd / 'result.md'}` | `{rd / 'transcript.md'}` |"
+        )
+    write(d / "thread.md", "\n".join(lines) + "\n")
+
+
+def append_thread(name: str, run_dir: Path, target: str, agent: str, status: str) -> None:
+    entries = load_thread(name)
+    entries.append(
+        {
+            "id": run_dir.name,
+            "dir": str(run_dir),
+            "target": target,
+            "agent": agent,
+            "status": status,
+        }
+    )
+    save_thread(name, entries)
+
+
+def append_note(name: str, note: str) -> None:
+    d = thread_dir(name)
+    prev = read(d / "handoff.md")
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    write(d / "handoff.md", prev + f"\n## {stamp}\n{note.strip()}\n")
+
+
+def resolve_run(spec: str) -> Path:
+    spec = spec.strip()
+    if spec == "last":
+        if not LAST.exists():
+            die("no last run")
+        return Path(LAST.read_text().strip())
+    p = Path(spec).expanduser()
+    if p.is_file():
+        p = p.parent
+    if p.is_dir() and (p / "result.md").exists():
+        return p
+    cand = RUNS / spec
+    if cand.is_dir():
+        return cand
+    matches = sorted(RUNS.glob(f"*{spec}*")) if RUNS.exists() else []
+    if len(matches) == 1:
+        return matches[0]
+    die(f"cannot resolve run '{spec}'")
+    return cand
+
+
+def should_inline(status: str, agent: str, transcript: str, full: bool, card_only: bool) -> bool:
+    if card_only:
+        return False
+    if full:
+        return True
+    if status in ("blocked", "needs-decision", "timeout", "unknown", "auth"):
+        return True
+    if agent in ("review", "consult") and len(transcript) <= INLINE_LIMIT:
+        return True
+    return len(transcript) <= INLINE_LIMIT
+
+
+def format_peer_bundle(run_dir: Path, agent: str, full: bool, card_only: bool) -> str:
+    result = read(run_dir / "result.md") or "(no result.md)"
+    transcript = read(run_dir / "transcript.md")
+    meta = json.loads(read(run_dir / "meta.json") or "{}")
+    status = meta.get("status") or "unknown"
+    who = f"{meta.get('target', '?')} {meta.get('agent', '?')}"
+    parts = [
+        f"### {who}  RUN {run_dir.name}  STATUS {status}",
+        f"PROMPT: {run_dir / 'prompt.md'}",
+        f"RESULT: {run_dir / 'result.md'}",
+        f"TRANSCRIPT: {run_dir / 'transcript.md'}",
+        "RESULT card:",
+        result.strip() or "(empty)",
+    ]
+    if should_inline(status, agent, transcript, full, card_only) and transcript.strip():
+        body = transcript.strip()
+        if len(body) > INLINE_LIMIT and not full:
+            body = body[:INLINE_LIMIT] + f"\n… truncated; full file: {run_dir / 'transcript.md'}\n"
+        parts += ["Transcript (inlined because the card is likely missing context):", body]
+    else:
+        parts.append(
+            "Transcript not inlined (save tokens). If you need attempts, errors, "
+            f"rejected options, or reasoning, Read {run_dir / 'transcript.md'} now."
+        )
+    return "\n".join(parts)
+
+
+def collect_see(args: argparse.Namespace) -> list[Path]:
+    specs: list[str] = []
+    if getattr(args, "against", None):
+        specs.append(args.against)
+    for s in getattr(args, "see", None) or []:
+        specs.append(s)
+    thread = getattr(args, "thread", None)
+    fresh = getattr(args, "fresh", False)
+    if thread and not fresh and "thread" not in specs:
+        specs.append("thread")
+    out: list[Path] = []
+    seen: set[str] = set()
+    for spec in specs:
+        if spec == "thread":
+            if not thread:
+                die("--see thread needs a thread (cd into a git repo)")
+            for e in load_thread(thread):
+                p = Path(e["dir"])
+                if p.exists() and str(p) not in seen:
+                    seen.add(str(p))
+                    out.append(p)
+            continue
+        p = resolve_run(spec)
+        if str(p) not in seen:
+            seen.add(str(p))
+            out.append(p)
+    return out
+
+
+def build_prompt(args: argparse.Namespace, task: str, cwd: Path) -> str:
+    caller = P.detect_caller()
+    parts = [
+        ROLES[args.agent],
+        RESEARCH_CONTRACT if args.agent == "research" else CONTRACT,
+        f"You are `{args.target}` on this desk."
+        + (f" The caller is `{caller}` — a different product. Do not call them back via peers." if caller else ""),
+        D.lean_in(args.target),
+        "Repo snapshot (names only, not diffs):",
+        repo_snapshot(cwd),
+    ]
+    thread = getattr(args, "thread", None)
+    if thread:
+        d = thread_dir(thread)
+        parts += [
+            f"You are on thread `{slug(thread)}`. Colleagues leave RESULT cards and transcripts here.",
+            f"Thread index: {d / 'thread.md'}",
+        ]
+        handoff = read(d / "handoff.md")
+        if handoff.strip():
+            parts += ["Caller notes (what a peer on this desk already knows):", handoff.strip()]
+    note = getattr(args, "note", None)
+    if note:
+        parts += ["Additional note from the caller:", note.strip()]
+        if thread:
+            append_note(thread, note)
+    bundles = collect_see(args)
+    if bundles:
+        parts.append(
+            "Peer work on this desk. Start from RESULT cards. "
+            "Read a TRANSCRIPT if you are missing why/how/what-failed."
+        )
+        full = getattr(args, "full", False)
+        card_only = getattr(args, "card_only", False)
+        seen_who: set[str] = set()
+        for b in bundles:
+            parts.append(format_peer_bundle(b, args.agent, full, card_only))
+            meta = json.loads(read(b / "meta.json") or "{}")
+            other = meta.get("target")
+            if other and other != args.target and other not in seen_who:
+                seen_who.add(other)
+                line = D.counterpart(other)
+                dpath = D.dossier_path(other)
+                extra = f" Counterpart {other}: {line}"
+                if dpath:
+                    extra += f" Dossier (Read only if you need how they fail): {dpath}"
+                parts.append(extra)
+    parts += ["Task:", task.strip()]
+    return "\n\n".join(parts) + "\n"
+
+
+def isolate_worktree(cwd: Path, run_id: str) -> Path:
+    git = which("git")
+    if not git:
+        die("--isolate needs git")
+    wt = ROOT / "wt" / run_id
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    p = subprocess.run(
+        [git, "worktree", "add", "-b", f"peers/{run_id}", str(wt), "HEAD"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if p.returncode != 0:
+        die(f"worktree failed: {p.stderr.strip() or p.stdout.strip()}")
+    return wt
+
+
+def _kill_pg(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _write_live(run_dir: Path, lines: list[str], elapsed: int, last: str, who: str) -> None:
+    tail = [ln for ln in lines if ln.strip()][-24:]
+    write(run_dir / "live.md", "".join(tail) if tail else "(no output yet)\n")
+    write(
+        run_dir / "status.json",
+        json.dumps({"who": who, "elapsed": elapsed, "last": last[:200], "status": "running"}) + "\n",
+    )
+
+
+def run_cmd(
+    argv: list[str],
+    cwd: Path,
+    timeout: int,
+    *,
+    run_dir: Path | None = None,
+    who: str = "",
+) -> tuple[int, str, str]:
+    """Stream the other branch into this session. Transcript on disk; heartbeats on stdout."""
+    prefix = f"[{who}] " if who else ""
+    out_lines: list[str] = []
+    err_lines: list[str] = []
+    last = ""
+    started = time.time()
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=P._quiet_env(),
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        return 3, "", f"{PROG}: command not found: {argv[0]}\n"
+
+    q: Queue = Queue()
+
+    def pump(stream, tag: str) -> None:
+        try:
+            for line in iter(stream.readline, ""):
+                q.put((tag, line))
+        finally:
+            q.put((tag, None))
+
+    threading.Thread(target=pump, args=(proc.stdout, "out"), daemon=True).start()
+    threading.Thread(target=pump, args=(proc.stderr, "err"), daemon=True).start()
+    done = {"out": False, "err": False}
+    last_beat = 0.0
+    timed_out = False
+
+    while not (done["out"] and done["err"] and proc.poll() is not None):
+        if time.time() - started > timeout:
+            timed_out = True
+            _kill_pg(proc)
+            break
+        try:
+            tag, line = q.get(timeout=0.4)
+        except Empty:
+            now = time.time()
+            if now - last_beat >= 4:
+                elapsed = int(now - started)
+                snippet = last[:72] if last else "working"
+                print(f"{prefix}… {elapsed}s  {snippet}", flush=True)
+                if run_dir:
+                    _write_live(run_dir, out_lines, elapsed, last, who)
+                last_beat = now
+            continue
+        if line is None:
+            done[tag] = True
+            continue
+        if tag == "out":
+            out_lines.append(line)
+            stripped = ANSI.sub("", line).strip()
+            if stripped and not stripped.startswith(("> build", "> ")):
+                last = stripped
+            if run_dir:
+                with (run_dir / "transcript.md").open("a", encoding="utf-8") as fh:
+                    fh.write(ANSI.sub("", line))
+        else:
+            err_lines.append(line)
+            if run_dir:
+                with (run_dir / "stderr.log").open("a", encoding="utf-8") as fh:
+                    fh.write(line)
+
+    # drain
+    while True:
+        try:
+            tag, line = q.get_nowait()
+        except Empty:
+            break
+        if line is None:
+            continue
+        if tag == "out":
+            out_lines.append(line)
+        else:
+            err_lines.append(line)
+
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        _kill_pg(proc)
+        proc.wait(timeout=3)
+
+    out = "".join(out_lines)
+    err = "".join(err_lines)
+    if timed_out:
+        return 142, out, err + f"\n{PROG}: TIMEOUT after {timeout}s\n"
+    return proc.returncode or 0, out, err
+
+
+def auth_blocked_result(detail: str, login: str) -> str:
+    return (
+        "## RESULT\nSTATUS: auth\n"
+        f"SUMMARY: not authenticated — {detail}. Re-auth: {login}\n"
+        "FILES: none\nVERIFY: n/a\nDECISION: re-authenticate this CLI, then retry\n"
+        "DISAGREE: none\n"
+    )
+
+
+def empty_or_auth_status(rc: int, stdout: str, stderr: str, transcript: str) -> tuple[str, str] | None:
+    blob = f"{stdout}\n{stderr}\n{transcript}"
+    if P.AUTH_FAIL.search(blob):
+        return "auth", auth_blocked_result(
+            "login/401 detected in output",
+            "peers doctor",
+        )
+    if rc == 142 and not transcript.strip():
+        return "timeout", (
+            "## RESULT\nSTATUS: timeout\n"
+            "SUMMARY: timed out with an empty transcript — usually a login prompt, "
+            "a hung CLI, or a provider that never wrote output. Run `peers doctor`.\n"
+            "FILES: none\nVERIFY: n/a\nDECISION: peers doctor, then retry\nDISAGREE: none\n"
+        )
+    if rc == 0 and not transcript.strip():
+        return "blocked", (
+            "## RESULT\nSTATUS: blocked\n"
+            "SUMMARY: CLI exited 0 but wrote an empty transcript. "
+            "Treat as failed. Check LOG and `peers doctor`.\n"
+            "FILES: none\nVERIFY: n/a\nDECISION: none\nDISAGREE: none\n"
+        )
+    return None
+
+
+def finish_run(run_dir: Path, rc: int, stdout: str, stderr: str) -> str:
+    transcript = strip_ansi(stdout)
+    write(run_dir / "transcript.md", transcript)
+    write(run_dir / "stderr.log", stderr)
+    forced = empty_or_auth_status(rc, stdout, stderr, transcript)
+    if forced:
+        status, result = forced
+    else:
+        result, status = extract_result(transcript)
+        if rc == 142:
+            status = "timeout"
+            result = (
+                "## RESULT\nSTATUS: timeout\nSUMMARY: timed out\n"
+                "FILES: none\nVERIFY: n/a\nDECISION: none\nDISAGREE: none\n"
+            )
+        elif rc != 0 and status in ("done", "unknown"):
+            status = "blocked"
+    write(run_dir / "result.md", result)
+    meta_path = run_dir / "meta.json"
+    meta = json.loads(read(meta_path) or "{}")
+    meta.update({"rc": rc, "status": status})
+    write(meta_path, json.dumps(meta, indent=2) + "\n")
+    observe(meta.get("target") or "", status, result)
+    return status
+
+
+def observe(who: str, status: str, result: str) -> None:
+    """Cheap empirical log. Promote into dossiers/ when a pattern repeats. No LLM."""
+    m = re.search(r"^DISAGREE:\s*(.*)$", result, re.M)
+    disagree = (m.group(1).strip() if m else "")
+    interesting = status in ("auth", "timeout", "blocked") or (
+        disagree and disagree.lower() not in ("none", "n/a", "no", "-", "")
+    )
+    if not interesting:
+        return
+    line = f"- {time.strftime('%Y-%m-%d %H:%M')} `{who}` STATUS {status}"
+    if disagree and disagree.lower() not in ("none", "n/a", "no", "-", ""):
+        line += f" DISAGREE: {disagree[:200]}"
+    path = ROOT / "observed.md"
+    prev = read(path)
+    if not prev:
+        prev = (
+            "# observed\n\n"
+            "Empirical notes from this desk. Outranks blog dossiers when they conflict.\n\n"
+        )
+    write(path, prev + line + "\n")
+
+
+def ns_defaults(args: argparse.Namespace) -> None:
+    for k, v in {
+        "thread": None,
+        "see": None,
+        "against": None,
+        "full": False,
+        "card_only": False,
+        "fresh": False,
+        "note": None,
+        "isolate": False,
+        "force": True,
+        "dry_run": False,
+        "model": None,
+        "timeout": None,
+        "name": None,
+        "no_thread": False,
+        "allow_self": False,
+        "with_peers": None,
+        "agent": "worker",
+        "cwd": os.getcwd(),
+        "target": None,
+        "task_file": None,
+        "task": None,
+    }.items():
+        if not hasattr(args, k):
+            setattr(args, k, v)
+
+
+def parse_with(args: argparse.Namespace) -> list[str] | None:
+    w = getattr(args, "with_peers", None)
+    if not w:
+        return None
+    parts = [p.strip() for p in w.replace("+", ",").split(",") if p.strip()]
+    if not parts:
+        die("--with wants names, e.g. opus,codex,gemini")
+    seen: list[str] = []
+    for p in parts:
+        if p not in seen:
+            seen.append(p)
+    return seen
+
+
+def ensure_not_self(who: str, args: argparse.Namespace) -> None:
+    if getattr(args, "allow_self", False) or P.allow_self():
+        return
+    if P.is_self(who):
+        die(P.self_message(who))
+
+
+def run_target(args: argparse.Namespace, task: str, *, silent: bool = False) -> tuple[int, Path, str]:
+    ns_defaults(args)
+    cwd = Path(args.cwd).resolve()
+    if not cwd.is_dir():
+        die(f"cwd not a directory: {cwd}")
+    apply_thread(args, cwd)
+    ensure_not_self(args.target, args)
+    try:
+        prov, model, alias = P.resolve(args.target, args.model)
+    except KeyError as e:
+        die(str(e))
+    args.target = alias
+    prompt = build_prompt(args, task, cwd)
+    run_dir = new_run(args.name or f"{alias}-{args.agent}")
+    extra: dict[str, str] = {"PEER": alias, "PROVIDER": prov.id}
+    work_cwd = cwd
+    if args.isolate:
+        wt = isolate_worktree(cwd, run_dir.name)
+        work_cwd = wt
+        extra["WORKTREE"] = str(wt)
+        extra["BRANCH"] = f"peers/{run_dir.name}"
+    if args.thread:
+        extra["THREAD"] = str(thread_dir(args.thread) / "thread.md")
+    write(run_dir / "prompt.md", prompt)
+    write(
+        run_dir / "meta.json",
+        json.dumps(
+            {
+                "target": alias,
+                "provider": prov.id,
+                "agent": args.agent,
+                "cwd": str(work_cwd),
+                "model": model,
+                "thread": args.thread,
+            },
+            indent=2,
+        )
+        + "\n",
+    )
+    if args.dry_run:
+        write(
+            run_dir / "result.md",
+            "## RESULT\nSTATUS: dry-run\nSUMMARY: prompt written, not executed\n"
+            "FILES: none\nVERIFY: n/a\nDECISION: none\nDISAGREE: none\n",
+        )
+        if args.thread:
+            append_thread(args.thread, run_dir, alias, args.agent, "dry-run")
+        if not silent:
+            print_card(run_dir, "dry-run", extra)
+        return 0, run_dir, "dry-run"
+
+    bin = prov.find()
+    if not bin:
+        die(f"{prov.id} not on PATH\n  {prov.hint}")
+    state, detail = P.probe(prov)
+    if state != "ok":
+        write(run_dir / "result.md", auth_blocked_result(detail, prov.login))
+        write(run_dir / "transcript.md", "")
+        write(run_dir / "stderr.log", f"{state}: {detail}\n")
+        if args.thread:
+            append_thread(args.thread, run_dir, alias, args.agent, "auth")
+        if not silent:
+            print_card(run_dir, "auth", {**extra, "FIX": prov.login})
+        return 1, run_dir, "auth"
+
+    argv = prov.argv(bin, model, prompt, args.force, args.agent)
+    timeout = args.timeout or prov.timeout
+    extra["LIVE"] = str(run_dir / "transcript.md")
+    extra["TAIL"] = str(run_dir / "live.md")
+    write(run_dir / "transcript.md", "")
+    write(run_dir / "stderr.log", "")
+    write(run_dir / "live.md", "(waiting)\n")
+    print(
+        f"STATUS: running\nPEER: {alias}\nLIVE: {run_dir / 'transcript.md'}\n"
+        f"TAIL: {run_dir / 'live.md'}\n"
+        + (f"THREAD: {extra['THREAD']}\n" if "THREAD" in extra else ""),
+        flush=True,
+    )
+    rc, out, err = run_cmd(argv, work_cwd, timeout, run_dir=run_dir, who=alias)
+    if prov.id == "dsv4" and rc == 0:
+        m = re.search(r"^OUTPUT:\s+(\S+)", out, re.M)
+        if m:
+            got = P.safe_read_path(m.group(1), extra_roots=[ROOT, run_dir])
+            if got is not None:
+                out = got
+    status = finish_run(run_dir, rc, out, err)
+    if args.thread:
+        append_thread(args.thread, run_dir, alias, args.agent, status)
+    if not silent:
+        extra_out = dict(extra)
+        if status == "auth":
+            extra_out["FIX"] = prov.login
+        print_card(run_dir, status, extra_out)
+    if rc == 142:
+        return 2, run_dir, status
+    return (0 if rc == 0 and status not in ("auth", "blocked", "timeout") else 1), run_dir, status
+
+
+def clone_ns(args: argparse.Namespace, **over: object) -> argparse.Namespace:
+    d = dict(vars(args))
+    d.update(over)
+    return argparse.Namespace(**d)
+
+
+def split_self(names: list[str], args: argparse.Namespace) -> tuple[list[str], str | None]:
+    """Drop the caller's own product. That half of the desk is this session."""
+    if getattr(args, "allow_self", False) or P.allow_self():
+        return names, None
+    invoke: list[str] = []
+    native: str | None = None
+    for t in names:
+        if P.is_self(t):
+            native = t
+        else:
+            invoke.append(t)
+    return invoke, native
+
+
+def resolve_desk(
+    args: argparse.Namespace,
+    *,
+    n: int = 3,
+    role: str | None = None,
+    task: str = "",
+) -> tuple[list[str], str | None]:
+    """Who to spawn, plus you (native) when the caller is already a peer."""
+    caller = P.detect_caller()
+    explicit = parse_with(args)
+    if explicit:
+        invoke, native = split_self(explicit, args)
+        if not invoke:
+            die("that desk is only you. Use native Task, or pick someone else (`peers providers`).")
+        return invoke, native
+    have = P.available_aliases(exclude_self=True, authed=True)
+    if not have:
+        die(
+            "need an authenticated peer that isn't you.\n"
+            f"  caller: {caller or 'unknown'}\n"
+            f"  {PROG} doctor"
+        )
+    if role and task:
+        picked = D.route_many(task, role, have, n=n)
+    else:
+        picked = P.pick_desk(n)
+    if not picked:
+        picked = have[:n]
+    native = None
+    if caller and not getattr(args, "allow_self", False) and not P.allow_self():
+        native = caller
+    return picked, native
+
+
+def cmd_fanout(
+    args: argparse.Namespace,
+    task: str,
+    invoke: list[str],
+    native: str | None,
+    *,
+    title: str,
+    tasks: dict[str, str] | None = None,
+) -> int:
+    apply_thread(args, Path(args.cwd).resolve())
+    parent = new_run(args.name or f"{title.lower()}-{args.agent}")
+    desk = "+".join(invoke + ([f"{native}(you)"] if native else []))
+    extra = {"DESK": desk}
+    print(f"DESK: {desk}", flush=True)
+    if native:
+        extra["NATIVE"] = (
+            f"you are {native} — your take in THIS session. "
+            f"Then `{PROG} note \"your take\"` and `{PROG} huddle`."
+        )
+    if args.thread:
+        extra["THREAD"] = str(thread_dir(args.thread) / "thread.md")
+        if native:
+            append_note(
+                args.thread,
+                f"caller ({native}) is taking this independently in-session. "
+                "Do not wait for a CLI run of that product.",
+            )
+    prior = list(args.see or [])
+    if args.thread and not args.fresh:
+        prior.extend(e["dir"] for e in load_thread(args.thread))
+    if args.dry_run:
+        who = ", ".join(invoke) + (" + you" if native else "")
+        write(
+            parent / "result.md",
+            "## RESULT\nSTATUS: dry-run\n"
+            f"SUMMARY: would run {who} independently, then they share a thread\n"
+            "FILES: none\nVERIFY: n/a\nDECISION: none\nDISAGREE: none\n",
+        )
+        print_card(parent, "dry-run", extra)
+        return 0
+
+    def one(target: str) -> tuple[str, Path, int, str]:
+        ns = clone_ns(
+            args,
+            target=target,
+            name=f"{target}-{args.agent}",
+            fresh=True,
+            see=prior,
+            dry_run=False,
+        )
+        piece = (tasks or {}).get(target, task)
+        rc, run_dir, status = run_target(ns, piece, silent=True)
+        return target, run_dir, rc, status
+
+    results: dict[str, tuple[Path, int, str]] = {}
+    with ThreadPoolExecutor(max_workers=min(POOL, max(1, len(invoke)))) as ex:
+        futs = {ex.submit(one, t): t for t in invoke}
+        for fut in as_completed(futs):
+            target, run_dir, rc, status = fut.result()
+            results[target] = (run_dir, rc, status)
+
+    parts = [f"# {title} — independent first pass ({desk}). Next: `{PROG} huddle`.\n"]
+    extra_paths: dict[str, str] = dict(extra)
+    fail = 0
+    for t in invoke:
+        run_dir, rc, st = results[t]
+        if rc != 0:
+            fail += 1
+        parts += [
+            f"## {t.upper()} ({st})\n{read(run_dir / 'result.md')}\n",
+            f"TRANSCRIPT: {run_dir / 'transcript.md'}\n",
+        ]
+        extra_paths[f"{t.upper()}_RESULT"] = str(run_dir / "result.md")
+        extra_paths[f"{t.upper()}_TRANSCRIPT"] = str(run_dir / "transcript.md")
+    if native:
+        parts.append(
+            f"## {native.upper()} (you, native)\n"
+            "Do your independent take here. Do not spawn your own CLI.\n"
+            f"Then: `{PROG} note \"…\"` and `{PROG} huddle`.\n"
+        )
+        extra_paths["NEXT"] = f"{PROG} note \"your take\" && {PROG} huddle"
+    else:
+        extra_paths["NEXT"] = f"{PROG} huddle"
+    extra_paths["MERGED"] = str(parent / "result.md")
+    merged = "\n".join(parts)
+    write(parent / "result.md", merged)
+    write(parent / "transcript.md", merged)
+    write(
+        parent / "meta.json",
+        json.dumps(
+            {"invoke": invoke, "native": native, "thread": args.thread, "title": title},
+            indent=2,
+        )
+        + "\n",
+    )
+    status = "done" if fail == 0 else "blocked"
+    print_card(parent, status, extra_paths)
+    return 0 if fail == 0 else 1
+
+
+def cmd_both(args: argparse.Namespace, task: str) -> int:
+    invoke, native = resolve_desk(args, n=3)
+    return cmd_fanout(args, task, invoke, native, title="DESK")
+
+
+def cmd_research(args: argparse.Namespace, task: str) -> int:
+    args.agent = "research"
+    invoke, native = resolve_desk(args, n=3, role="research", task=task)
+    slices = D.research_slices(invoke)
+    tasks = {t: f"{task.strip()}\n\n{slices.get(t, '')}".strip() for t in invoke}
+    return cmd_fanout(args, task, invoke, native, title="RESEARCH", tasks=tasks)
+
+
+def last_on_thread(name: str, target: str) -> Path | None:
+    for e in reversed(load_thread(name)):
+        if e.get("target") == target:
+            p = Path(e["dir"])
+            if p.exists():
+                return p
+    return None
+
+
+def last_distinct_peers(name: str, limit: int = 6) -> list[str]:
+    seen: list[str] = []
+    for e in reversed(load_thread(name)):
+        t = e.get("target")
+        if t and t not in seen:
+            seen.append(t)
+        if len(seen) >= limit:
+            break
+    seen.reverse()
+    return seen
+
+
+def cmd_huddle(args: argparse.Namespace, task: str) -> int:
+    apply_thread(args, Path(args.cwd).resolve())
+    if not args.thread:
+        die("huddle needs a thread (cd into a git repo, or pass --thread name)")
+    explicit = parse_with(args)
+    if explicit:
+        names = explicit
+    else:
+        names = last_distinct_peers(args.thread)
+        if not names:
+            other = P.pick_one()
+            if other:
+                names = [other]
+    invoke, native = split_self(names, args) if names else ([], P.detect_caller())
+    if not invoke:
+        # still huddle the last non-self run on the thread
+        for e in reversed(load_thread(args.thread)):
+            t = e.get("target")
+            if t and not P.is_self(t):
+                invoke = [t]
+                break
+    if not invoke:
+        die(
+            f"huddle needs a peer run on thread `{args.thread}` first.\n"
+            f"  {PROG} research \"your question\"\n"
+            f"  {PROG} huddle"
+        )
+    if not task.strip():
+        task = HUDDLE_TASK
+    parent = new_run(args.name or "huddle")
+
+    def one(target: str) -> tuple[str, Path, int, str]:
+        ns = clone_ns(
+            args,
+            target=target,
+            agent=args.agent or "consult",
+            name=f"huddle-{target}",
+            fresh=False,
+            see=["thread"],
+            full=False if args.card_only else True,
+            dry_run=args.dry_run,
+        )
+        rc, run_dir, status = run_target(ns, task, silent=True)
+        return target, run_dir, rc, status
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(POOL, max(1, len(invoke)))) as ex:
+        futs = [ex.submit(one, t) for t in invoke]
+        for fut in as_completed(futs):
+            target, run_dir, rc, status = fut.result()
+            results[target] = (run_dir, rc, status)
+    parts = ["# HUDDLE — peers read the desk (RESULT + TRANSCRIPT + your notes).\n"]
+    extra: dict[str, str] = {
+        "THREAD": str(thread_dir(args.thread) / "thread.md"),
+        "DESK": "+".join(invoke + ([f"{native}(you)"] if native else [])),
+    }
+    fail = 0
+    for t in invoke:
+        run_dir, rc, st = results[t]
+        if rc != 0:
+            fail += 1
+        parts += [
+            f"## {t.upper()} after reading the desk ({st})\n{read(run_dir / 'result.md')}\n",
+            f"TRANSCRIPT: {run_dir / 'transcript.md'}\n",
+        ]
+        extra[f"{t.upper()}_RESULT"] = str(run_dir / "result.md")
+        extra[f"{t.upper()}_TRANSCRIPT"] = str(run_dir / "transcript.md")
+    if native or P.detect_caller():
+        who = native or P.detect_caller()
+        parts.append(
+            f"## {who} (you, native)\n"
+            "Read the TRANSCRIPT paths above in this session. Respond here. "
+            f"Do not `{PROG} {who}`.\n"
+        )
+        extra["NATIVE"] = f"you are {who} — read the transcripts, respond here"
+    extra["MERGED"] = str(parent / "result.md")
+    write(parent / "result.md", "\n".join(parts))
+    status = "done" if fail == 0 else "blocked"
+    print_card(parent, status, extra)
+    return 0 if fail == 0 else 1
+
+
+def cmd_note(args: argparse.Namespace, text: str) -> int:
+    apply_thread(args, Path(args.cwd).resolve())
+    if not args.thread:
+        die("note needs a thread (cd into a git repo, or pass --thread name)")
+    if not text.strip():
+        die("note needs text — this is YOUR take, so the other peer can read it")
+    caller = P.detect_caller() or "caller"
+    append_note(args.thread, f"({caller}) {text.strip()}")
+    d = thread_dir(args.thread)
+    print(f"NOTE: {d / 'handoff.md'}")
+    print(f"THREAD: {d / 'thread.md'}")
+    print(f"NEXT: {PROG} huddle")
+    return 0
+
+
+def parse_jobs(text: str) -> list[tuple[str, str, str]]:
+    jobs = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            die(f"bad job line (want `grok worker: task`): {line}")
+        head, task = line.split(":", 1)
+        parts = head.split()
+        if len(parts) != 2:
+            die(f"bad job head (want `target agent`): {head}")
+        target, agent = parts
+        try:
+            P.resolve(target)
+        except KeyError:
+            die(f"unknown target '{target}' — peers providers")
+        if agent not in AGENTS:
+            die(f"unknown agent '{agent}'")
+        jobs.append((target, agent, task.strip()))
+    if not jobs:
+        die("no jobs")
+    return jobs
+
+
+def cmd_parallel(args: argparse.Namespace, blob: str) -> int:
+    jobs = parse_jobs(blob)
+    parent = new_run(args.name or "parallel")
+    if args.dry_run:
+        write(
+            parent / "result.md",
+            "## RESULT\nSTATUS: dry-run\nSUMMARY: "
+            + "; ".join(f"{t} {a}" for t, a, _ in jobs)
+            + "\nFILES: none\nVERIFY: n/a\nDECISION: none\nDISAGREE: none\n",
+        )
+        print_card(parent, "dry-run", {"JOBS": str(len(jobs))})
+        return 0
+
+    def one(i: int, target: str, agent: str, task: str) -> tuple[int, str, str, Path, int, str]:
+        ns = clone_ns(args, target=target, agent=agent, name=f"{i}-{target}-{agent}", dry_run=False)
+        try:
+            rc, run_dir, status = run_target(ns, task, silent=True)
+        except SystemExit as e:
+            rc = int(e.code) if isinstance(e.code, int) else 1
+            run_dir = parent
+            status = "blocked"
+        return i, target, agent, run_dir, rc, status
+
+    rows = []
+    ok = fail = 0
+    with ThreadPoolExecutor(max_workers=min(POOL, max(1, len(jobs)))) as ex:
+        futs = [ex.submit(one, i, t, a, task) for i, (t, a, task) in enumerate(jobs, 1)]
+        for fut in as_completed(futs):
+            i, target, agent, run_dir, rc, status = fut.result()
+            rows.append((i, target, agent, status, run_dir, rc))
+            if rc == 0:
+                ok += 1
+            else:
+                fail += 1
+    rows.sort()
+    index = ["# parallel", "", "| # | target | agent | status | result | transcript |", "|---|---|---|---|---|---|"]
+    for i, target, agent, status, run_dir, _rc in rows:
+        index.append(
+            f"| {i} | {target} | {agent} | {status} | `{run_dir / 'result.md'}` | `{run_dir / 'transcript.md'}` |"
+        )
+    write(parent / "result.md", "\n".join(index) + "\n")
+    print_card(
+        parent,
+        "done" if fail == 0 else "blocked",
+        {"JOBS": str(len(jobs)), "OK": str(ok), "FAIL": str(fail), "INDEX": str(parent / "result.md")},
+    )
+    return 0 if fail == 0 else 1
+
+
+def cmd_auto(args: argparse.Namespace, task: str) -> int:
+    have = P.available_aliases(exclude_self=True, authed=True)
+    who = D.route(task, args.agent, have) or P.pick_one()
+    if not who:
+        caller = P.detect_caller()
+        die(
+            "no authenticated peer that isn't you.\n"
+            f"  caller: {caller or 'unknown'}\n"
+            f"  {PROG} doctor"
+        )
+    args.target = who
+    print(f"{PROG}: auto → {who}", file=sys.stderr)
+    rc, _run, _st = run_target(args, task)
+    return rc
+
+
+def cmd_providers() -> int:
+    caller = P.detect_caller()
+    if caller:
+        print(f"caller  {caller}  (native Task for this product)")
+    print(f"{'id':12} {'state':8} detail")
+    ready = []
+    oc_ok = False
+    for pid, _bin, state, detail in P.status_rows():
+        mark = {"ok": "ok  ", "miss": "MISS", "auth": "AUTH", "timeout": "TIME"}.get(state, state)
+        print(f"{pid:12} {mark:8} {detail}")
+        if state == "ok" and not (caller and pid == caller):
+            ready.append(pid)
+        if pid == "opencode" and state == "ok":
+            oc_ok = True
+    print()
+    print("ready  " + (", ".join(P.available_aliases(exclude_self=True, authed=True)) or "(none)"))
+    desk = P.pick_desk(3)
+    print("desk   " + ("+".join(desk) if desk else "(need an authenticated peer)"))
+    auto = P.pick_one()
+    print("auto   " + (auto or "(none)"))
+    if oc_ok:
+        print("more   opencode /connect  then  peers zai | kimi | ollama | provider/model")
+    return 0 if ready else 3
+
+
+def cmd_doctor() -> int:
+    caller = P.detect_caller()
+    ensure_desk()
+    print(f"caller     {caller or 'unknown (human/shell)'}")
+    print(f"home       {ROOT}")
+    print(f"python     {sys.executable}")
+    git = which("git")
+    print(f"{'ok  ' if git else 'MISS'} git        {git or 'not on PATH'}")
+    print()
+    missing_backend = True
+    oc_ok = False
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futs = {ex.submit(P.probe, p): p for p in P.PROVIDERS.values() if p.find()}
+        missing = [p for p in P.PROVIDERS.values() if not p.find()]
+        for p in missing:
+            print(f"MISS {p.id:12} {p.hint}")
+        for fut in as_completed(futs):
+            p = futs[fut]
+            state, detail = fut.result()
+            tag = {"ok": "ok  ", "auth": "AUTH", "timeout": "TIME", "miss": "MISS"}.get(state, state)
+            self = "  [SELF]" if caller and p.id == caller else ""
+            print(f"{tag} {p.id:12} {detail}{self}")
+            if state == "ok":
+                missing_backend = False
+            if p.id == "opencode" and state == "ok":
+                oc_ok = True
+            if state == "auth":
+                print(f"     login      {p.login}")
+    print()
+    ready = P.available_aliases(exclude_self=True, authed=True)
+    print("ready      " + (", ".join(ready) or "(none)"))
+    desk = P.pick_desk(3)
+    if caller and desk:
+        print(f"desk       {'+'.join(desk)} + you({caller})")
+    else:
+        print("desk       " + ("+".join(desk) if desk else "(need an authenticated peer)"))
+    if oc_ok:
+        print("gateway    opencode /connect  →  peers zai | kimi | ollama | provider/model")
+    if missing_backend:
+        print(f"{PROG}: no coding CLI on PATH. Install one, or: opencode /connect", file=sys.stderr)
+        return 3
+    if not ready:
+        print(f"{PROG}: the only logged-in CLI is you. Native Task, or log into another plan.", file=sys.stderr)
+        return 0
+    print(f"NEXT: {PROG} auto \"task\"")
+    return 0
+
+
+def cmd_setup() -> int:
+    bin_dir = peers_bin_dir()
+    pkg = PACKAGE
+    home = Path.home()
+    mapping = [
+        (pkg / "skills/claude/SKILL.md", home / ".claude/skills/peers/SKILL.md"),
+        (pkg / "skills/claude/SKILL.md", home / ".claude/skills/delegate/SKILL.md"),
+        (pkg / "skills/cursor/SKILL.md", home / ".cursor/skills/peers/SKILL.md"),
+        (pkg / "skills/cursor/SKILL.md", home / ".cursor/skills/delegate/SKILL.md"),
+        (pkg / "skills/agents/SKILL.md", home / ".agents/skills/peers/SKILL.md"),
+        (pkg / "skills/agents/SKILL.md", home / ".agents/skills/delegate/SKILL.md"),
+        (pkg / "skills/agents/SKILL.md", home / ".codex/skills/peers/SKILL.md"),
+        (pkg / "commands/peers.md", home / ".claude/commands/peers.md"),
+        (pkg / "commands/peer.md", home / ".claude/commands/peer.md"),
+    ]
+    for src_p, dest in mapping:
+        if not src_p.exists():
+            print(f"skip {dest} (packaged skill missing: {src_p})")
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(src_p.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"ok   {dest}")
+    for stale in (
+        home / ".claude/skills/peerdesk",
+        home / ".cursor/skills/peerdesk",
+        home / ".agents/skills/peerdesk",
+        home / ".local/share/peerdesk",
+    ):
+        if stale.is_dir():
+            shutil.rmtree(stale)
+            print(f"ok   removed {stale}")
+    grok_cmd = home / ".claude/commands/grok.md"
+    if grok_cmd.exists():
+        grok_cmd.unlink()
+        print(f"ok   removed {grok_cmd}")
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    me = Path(__file__).resolve()
+    for name in ("peers", "peer"):
+        dest = bin_dir / name
+        if dest.is_symlink() or dest.exists():
+            dest.unlink()
+        dest.symlink_to(me)
+        print(f"ok   {dest} -> {me}")
+    for old in ("grok46", "opus-peer"):
+        dest = bin_dir / old
+        if dest.is_symlink() or dest.exists():
+            dest.unlink()
+            print(f"ok   removed {dest}")
+    print(f"{PROG} setup: skills + PATH shims installed")
+    return 0
+
+
+def cmd_last() -> int:
+    if not LAST.exists():
+        die("no runs yet")
+    run_dir = Path(LAST.read_text().strip())
+    result = run_dir / "result.md"
+    if not result.exists():
+        die(f"no result in {run_dir}")
+    sys.stdout.write(read(result))
+    print(f"RESULT: {result}", file=sys.stderr)
+    print(f"TRANSCRIPT: {run_dir / 'transcript.md'}", file=sys.stderr)
+    return 0
+
+
+def cmd_show(spec: str) -> int:
+    run_dir = resolve_run(spec)
+    print(f"RUN: {run_dir.name}")
+    print(f"RESULT: {run_dir / 'result.md'}")
+    print(f"TRANSCRIPT: {run_dir / 'transcript.md'}")
+    print(f"PROMPT: {run_dir / 'prompt.md'}")
+    print()
+    sys.stdout.write(read(run_dir / "result.md"))
+    return 0
+
+
+def cmd_cat(spec: str) -> int:
+    run_dir = resolve_run(spec)
+    sys.stdout.write(read(run_dir / "transcript.md"))
+    return 0
+
+
+def cmd_thread(name: str | None) -> int:
+    if not name:
+        if not THREADS.exists():
+            print("no threads yet")
+            return 0
+        for d in sorted(THREADS.iterdir()):
+            if d.is_dir():
+                n = len(load_thread(d.name))
+                print(f"{d.name:24} {n} turns  {d / 'thread.md'}")
+        return 0
+    d = thread_dir(name)
+    save_thread(name, load_thread(name))
+    sys.stdout.write(read(d / "thread.md"))
+    print(f"THREAD: {d / 'thread.md'}", file=sys.stderr)
+    return 0
+
+
+def cmd_ls() -> int:
+    if not RUNS.exists():
+        print("no runs yet")
+        return 0
+    rows = sorted(RUNS.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)[:20]
+    print(f"{'run':40} {'who':16} status")
+    for d in rows:
+        meta = json.loads(read(d / "meta.json") or "{}")
+        who = f"{meta.get('target','?'):8} {meta.get('agent','?')}"
+        print(f"{d.name:40} {who:16} {meta.get('status','')}")
+    return 0
+
+
+def add_common(p: argparse.ArgumentParser, default_agent: str = "worker") -> None:
+    p.add_argument("--agent", choices=AGENTS, default=default_agent)
+    p.add_argument("--model", default=None)
+    p.add_argument("--timeout", type=int, default=None)
+    p.add_argument("--file", dest="task_file", default=None)
+    p.add_argument("--against", default=None, help="compat: path to a result.md (same as --see)")
+    p.add_argument("--see", action="append", default=None, help="last | thread | run-id | path (repeatable)")
+    p.add_argument("--thread", default=None, help="shared desk name; defaults to the repo folder")
+    p.add_argument("--note", default=None, help="what YOU already know — written onto the thread")
+    p.add_argument("--full", action="store_true", help="inline transcripts")
+    p.add_argument("--card-only", action="store_true", help="never inline transcripts")
+    p.add_argument("--fresh", action="store_true", help="ignore thread history")
+    p.add_argument("--no-thread", action="store_true")
+    p.add_argument("--with", dest="with_peers", default=None, help="peers for both/research/huddle, e.g. opus,codex,gemini")
+    p.add_argument("--allow-self", action="store_true", help="allow calling the same product (don't)")
+    p.add_argument(
+        "--cwd",
+        default=os.environ.get("PEERS_CWD") or os.getcwd(),
+    )
+    p.add_argument("--name", default=None)
+    p.add_argument("--isolate", action="store_true")
+    p.add_argument("--force", action="store_true", default=True)
+    p.add_argument("--no-force", action="store_false", dest="force")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("task", nargs="*", help="task text")
+
+
+def read_task(args: argparse.Namespace, required: bool = True) -> str:
+    if getattr(args, "task_file", None):
+        return Path(args.task_file).read_text(encoding="utf-8")
+    if getattr(args, "task", None):
+        return " ".join(args.task)
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    if required:
+        die("no task (pass text, --file, or stdin)")
+    return ""
+
+
+def parse_run_args(argv: list[str], default_agent: str = "worker") -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog=PROG, add_help=True)
+    add_common(p, default_agent=default_agent)
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or argv[0] in ("help", "-h", "--help"):
+        print(GUIDE.strip() + "\n")
+        return 0
+    if argv[0] in ("--version", "version"):
+        print(f"peers {VERSION}")
+        return 0
+
+    cmd = argv[0]
+    rest = argv[1:]
+
+    if cmd == "setup":
+        return cmd_setup()
+    if cmd == "doctor":
+        return cmd_doctor()
+    if cmd == "providers":
+        return cmd_providers()
+    if cmd == "last":
+        return cmd_last()
+    if cmd == "ls":
+        return cmd_ls()
+    if cmd == "show":
+        if not rest:
+            die("show needs a run spec (last | id | path)")
+        return cmd_show(rest[0])
+    if cmd == "cat":
+        if not rest:
+            die("cat needs a run spec (last | id | path)")
+        return cmd_cat(rest[0])
+    if cmd == "thread":
+        return cmd_thread(rest[0] if rest else None)
+    if cmd == "note":
+        args = parse_run_args(rest)
+        return cmd_note(args, read_task(args))
+
+    if cmd in ("both", "huddle", "parallel", "auto", "research"):
+        args = parse_run_args(
+            rest,
+            default_agent="consult" if cmd == "huddle" else ("research" if cmd == "research" else "worker"),
+        )
+        if cmd == "huddle":
+            task = read_task(args, required=False) or HUDDLE_TASK
+            return cmd_huddle(args, task)
+        task = read_task(args)
+        if cmd == "both":
+            return cmd_both(args, task)
+        if cmd == "research":
+            return cmd_research(args, task)
+        if cmd == "parallel":
+            return cmd_parallel(args, task)
+        return cmd_auto(args, task)
+
+    # `peers <who> …` — any alias or provider, not a hardcoded subparser
+    try:
+        P.resolve(cmd)
+    except KeyError:
+        die(f"unknown command or peer '{cmd}'.\n{GUIDE.strip()}")
+
+    args = parse_run_args(rest)
+    args.target = cmd
+    task = read_task(args)
+    rc, _run_dir, _status = run_target(args, task)
+    return rc
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

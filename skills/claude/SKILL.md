@@ -1,29 +1,38 @@
 ---
-name: peerdesk
-description: Use when work can split across Grok 4.6, Opus, or DeepSeek, when a second senior should implement or review, when models should share a thread and read each other's transcripts, or when the user says delegate, huddle, ask Grok, consult Cursor, or farm out.
+name: peers
+description: >-
+  Send work to a different coding plan than Claude. Never Claude/Opus/Sonnet.
+  Triggers: peers, huddle, research, delegate, farm out.
 ---
 
-# peerdesk
+# peers
 
-Grok 4.6 and Opus are **peers on a shared desk**. DeepSeek is optional cheap help. Same repo = same thread. No flags required.
+You are Claude. Native Task for same-model / this-session tools. `peers` is a
+*different* plan — their usage, not yours.
+
+Watch bash heartbeats (`STATUS: running`, `… 12s`, then RESULT). Don't cat
+unless the memo is thin. Don't spawn a watcher.
 
 ```bash
-peer grok "task with an acceptance test"
-peer opus --agent review
-peer huddle
+peers auto "task with an acceptance test"
+peers research "question that needs depth"
+peers both --with a,b,c "same question"
+peers note "my independent take"
+peers huddle
+peers doctor
+peers thread
 ```
 
-Read the printed **RESULT**. Open **TRANSCRIPT** (or `peer cat last`) if the card is thin, blocked, or they disagree. `--note` is what you already know.
+`a,b,c` are names from `peers providers`. Never your own product.
 
-| Situation | Command |
+| Situation | Route |
 |---|---|
-| Independent coding / long-running / UI | `peer grok "…"` |
-| Research | `peer grok --agent research "…"` |
-| Second opinion | `peer grok --agent review` or `peer opus --agent review` |
-| Hard call | `peer both "…"` then `peer huddle` |
-| Cheap mechanical | `peer ds "…"` (optional) |
-| This session’s MCP / browser / chat | native subagent — don’t hop CLIs |
+| This session's MCP / browser / 30s grep | native Task |
+| The peer who's good at this | `peers auto` |
+| Deep research, several slices | `peers research` |
+| Same question, several priors | `peers both --with a,b,c` |
+| Different jobs | `peers parallel` |
+| Login / 401 | `peers doctor` — do not retry |
 
-Do not default to a same-model subagent for work the other senior should own.
-
-After `both`, huddle. Disagreement is the signal.
+Never `peers opus` / `peers claude` / `peers sonnet`. After a desk run, huddle.
+`STATUS: auth` or an empty transcript means that branch is out — skip it.

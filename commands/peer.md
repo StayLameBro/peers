@@ -1,17 +1,14 @@
 ---
-description: Shared-desk peer CLI (Grok, Opus, both, huddle)
+description: Send work to other coding plans. Never call yourself.
 ---
 
-`peer` is the desk. Same repo = same thread.
+`peers` is the other plan. Watch bash heartbeats. Read RESULT.
 
-  peer grok "task"
-  peer opus --agent review
-  peer both "hard question"
-  peer huddle
-
-Read RESULT from the printed card. `peer cat last` for the transcript.
-If no args, run `peer` (cheatsheet) or `peer doctor`.
+  peers auto "task"
+  peers research "question"
+  peers huddle
+  peers doctor
 
 ~~~bash
-peer $ARGUMENTS
+peers $ARGUMENTS
 ~~~

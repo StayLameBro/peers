@@ -1,18 +1,36 @@
 ---
-name: peerdesk
-description: Use when work can split across Grok 4.6, Opus, or DeepSeek, when models should share a thread and read each other's transcripts, or when the user says delegate, huddle, ask Grok, ask Opus, or farm out.
+name: peers
+description: >-
+  Send work to a different coding plan than the one you are. Never call
+  yourself. Triggers: peers, huddle, research, delegate, farm out.
 ---
 
-# peerdesk
+# peers
 
-Grok 4.6 and Opus are peers on a shared desk. Same repo = same thread.
+Do not call your own product via `peers`. Native Task for your own model
+(this session's tools, tiny parallel). `peers` reaches a *different* plan.
+
+Watch bash heartbeats. Read the RESULT memo. Don't cat the transcript unless
+the memo is thin. Thread path: `peers thread`.
 
 ```bash
-peer grok "task"
-peer opus --agent review
-peer both "hard question"
-peer huddle
-peer cat last
+peers auto "task"
+peers research "question that needs depth"
+peers both --with a,b,c "same question"
+peers huddle
+peers doctor
+peers note "my take"
+peers thread
 ```
 
-`--note` is what you already know. After `both`, huddle so they read each other. Disagreement is the signal.
+`a,b,c` are names from `peers providers`.
+
+| Situation | Route |
+|---|---|
+| This session's tools / tiny parallel | native Task |
+| The peer who's good at this | `peers auto` |
+| Deep research, several slices | `peers research` |
+| Same question, several priors | `peers both --with a,b,c` |
+| Login / 401 | `peers doctor` |
+
+After a desk run, huddle. Disagreement is the signal.

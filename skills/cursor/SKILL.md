@@ -1,26 +1,39 @@
 ---
-name: peerdesk
-description: Delegates to peer models on a shared thread — Grok 4.6 (native Task or peer grok), Claude Opus (peer opus), DeepSeek (peer ds). Use when work can run in parallel, when a second senior should implement or review, when models should read each other's transcripts, or when the user says delegate, huddle, ask Opus, consult Claude, or farm out.
+name: peers
+description: >-
+  Send work to a different coding plan than Cursor. Never Cursor/Grok/Composer.
+  Triggers: peers, huddle, research, delegate, farm out.
 ---
 
-# peerdesk
+# peers
 
-Opus and Grok 4.6 are **peers on a shared desk**. Same repo = same thread.
+You are Cursor. Same-product work uses the Task tool (`inherit` / the model
+you already are). `peers` is a *different* plan.
+
+Watch bash heartbeats (`STATUS: running`, `… 12s`, then RESULT). Don't cat
+unless the memo is thin. Don't Task a watcher.
 
 ```bash
-peer opus --note "what you already know" "task"
-peer huddle
-peer cat last
+peers auto --note "what you already know" "task"
+peers research "question that needs depth"
+peers both --with a,b,c "same question"
+peers note "my independent take"
+peers huddle
+peers doctor
+peers thread
 ```
 
-Same-product Grok work uses the **Task** tool (`model: "cursor-grok-4.6-high"`), not `peer grok`. When you Task a Grok colleague, tell them the thread path (`peer thread` prints it) so they can Read Opus’s transcripts under `/tmp/peer/`.
+`a,b,c` are names from `peers providers`. When you Task a same-product
+colleague, give them `peers thread` so they can Read the other memos.
 
 | Situation | Route |
 |---|---|
-| Independent coding in Cursor | Task, `cursor-grok-4.6-high` |
-| Claude’s world / second opinion | `peer opus` |
-| Hard call | `peer both` then `peer huddle` |
-| Cheap mechanical | `peer ds` |
-| This session’s MCP / browser | native Task `inherit` |
+| Independent coding in Cursor | Task, `inherit` |
+| The peer who's good at this | `peers auto` |
+| Deep research, several slices | `peers research` |
+| Same question, several priors | `peers both --with a,b,c` |
+| This session's MCP / browser | native Task `inherit` |
+| Login / 401 | `peers doctor` |
 
-You read RESULT. The peer Reads TRANSCRIPT paths when the card isn’t enough. After `both`, huddle.
+Never `peers cursor` / `peers grok` / `peers composer`. After a desk run,
+`peers note` your take, then huddle.
