@@ -1,0 +1,22 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: compile
+        run: python3 -m py_compile peer
+      - name: cheatsheet
+        run: python3 peer | grep -q "two senior models"
+      - name: version
+        run: python3 peer version | grep -q peerdesk
+      - name: dry-run auto-thread
+        run: |
+          python3 peer grok --dry-run --cwd "$PWD" "noop"
+          python3 peer grok --dry-run --cwd "$PWD" "second" | grep -q THREAD
