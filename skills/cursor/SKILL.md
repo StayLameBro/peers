@@ -33,7 +33,7 @@ colleague, give them `peers thread` so they can Read the other memos.
 | Deep research, several slices | `peers research` |
 | Same question, several priors | `peers both --with a,b,c` |
 | This session's MCP / browser | native Task `inherit` |
-| Login / 401 | `peers doctor` |
+| Login / 401 | `peers doctor`. If ok, retry the same peer once. If AUTH, that CLI's login in a real terminal, then doctor. |
 
 Never `peers cursor` / `peers grok` / `peers composer`. After a desk run,
 `peers note` your take, then huddle.

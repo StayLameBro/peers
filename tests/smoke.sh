@@ -7,6 +7,7 @@ rm -rf "$PEERS_HOME"
 mkdir -p "$PEERS_HOME"
 python3 -m py_compile peers providers.py dossiers.py
 python3 peers | grep -q "one office"
+python3 peers | grep -q "cursor-agent login"
 python3 peers version | grep -q "peers 0.3"
 python3 tests/test_providers.py
 

@@ -31,6 +31,6 @@ peers thread
 | The peer who's good at this | `peers auto` |
 | Deep research, several slices | `peers research` |
 | Same question, several priors | `peers both --with a,b,c` |
-| Login / 401 | `peers doctor` |
+| Login / 401 | `peers doctor`. If ok, retry the same peer once. If AUTH, that CLI's login in a real terminal, then doctor. |
 
 After a desk run, huddle. Disagreement is the signal.

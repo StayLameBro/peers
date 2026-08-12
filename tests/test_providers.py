@@ -41,10 +41,23 @@ def main() -> int:
     check(P.AUTH_FAIL.search(blob) is not None, "detect cursor login prompt")
     blob = "401 OAuth access token has been revoked"
     check(P.AUTH_FAIL.search(blob) is not None, "detect claude 401")
+    check(P.AUTH_FAIL.search("handler returns 401 for bad tokens") is None, "bare 401 is not auth")
+    check(P.AUTH_FAIL.search("Starting login process...") is None, "cursor login chatter is not auth")
     state, detail = P.classify_auth(1, "", "401 OAuth access token has been revoked")
     check(state == "auth", f"401 classified as auth, got {state} {detail}")
     state, detail = P.classify_auth(0, "Press any key to sign in...", "")
     check(state == "auth", f"login prompt classified as auth, got {state}")
+
+    chatter = (
+        "Starting login process...\nAuthenticating with Cursor...\n"
+        "Checking authentication status...\n✓ Login successful!\nLogged in\n"
+    )
+    state, detail = P._parse_cursor_probe(0, chatter, "")
+    check(state == "ok", f"cursor chatter+logged in is ok, got {state} {detail}")
+    state, detail = P._parse_cursor_probe(142, "Starting login process...\n", "")
+    check(state == "timeout", f"cursor status timeout is timeout not auth, got {state} {detail}")
+    state, detail = P._parse_cursor_probe(0, "Press any key to sign in...", "")
+    check(state == "auth", f"press any key is auth, got {state}")
 
     prov, model, alias = P.resolve("grok")
     check(prov.id == "cursor" and model == "grok-4.6" and alias == "grok", "resolve grok")

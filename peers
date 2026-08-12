@@ -59,8 +59,16 @@ peers — every coding plan you already pay for. one office.
   peers note "my take"           your memo. don't hire a second you.
 
   peers providers                what's on PATH
-  peers doctor                   logins (won't hang)
+  peers doctor                   who's logged in (peers has no account)
   peers setup                    skills + shims
+
+Login is per CLI, in a real terminal — not peers:
+  cursor-agent login             Cursor / Grok
+  claude auth login              Claude / Opus
+  codex login                    Codex
+  opencode /connect              Z.AI, Kimi, Ollama, …
+Then: peers doctor
+Cursor status prints "Starting login process" even when you ARE logged in. That is a banner, not a bug.
 
 Same repo, same thread. A dropdown is for you. This is for the agent.
 Identity theft is not a joke: native Task for your own model.
@@ -559,7 +567,7 @@ def run_cmd(
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
-            env=P._quiet_env(),
+            env=P._run_env(),
             start_new_session=True,
         )
     except FileNotFoundError:
@@ -643,18 +651,27 @@ def run_cmd(
 def auth_blocked_result(detail: str, login: str) -> str:
     return (
         "## RESULT\nSTATUS: auth\n"
-        f"SUMMARY: not authenticated — {detail}. Re-auth: {login}\n"
-        "FILES: none\nVERIFY: n/a\nDECISION: re-authenticate this CLI, then retry\n"
+        f"SUMMARY: this CLI is not logged in ({detail}). "
+        "peers has no account of its own.\n"
+        f"FIX: {login}\n"
+        "THEN: peers doctor\n"
+        "RETRY: if doctor already showed this CLI as ok, retry the same peer once "
+        "(Cursor's 'Starting login process' banner is not a logout)\n"
+        "FILES: none\nVERIFY: n/a\nDECISION: run FIX in a real terminal, then doctor, then retry\n"
         "DISAGREE: none\n"
     )
 
 
 def empty_or_auth_status(rc: int, stdout: str, stderr: str, transcript: str) -> tuple[str, str] | None:
     blob = f"{stdout}\n{stderr}\n{transcript}"
-    if P.AUTH_FAIL.search(blob):
+    if RESULT_RE.search(transcript):
+        return None
+    if "press any key" in blob.lower() or (
+        P.AUTH_FAIL.search(blob) and not P.CURSOR_LOGIN_CHATTER.search(blob)
+    ):
         return "auth", auth_blocked_result(
             "login/401 detected in output",
-            "peers doctor",
+            "peers doctor — if that peer is ok, retry once",
         )
     if rc == 142 and not transcript.strip():
         return "timeout", (
@@ -832,7 +849,16 @@ def run_target(args: argparse.Namespace, task: str, *, silent: bool = False) -> 
         if args.thread:
             append_thread(args.thread, run_dir, alias, args.agent, "auth")
         if not silent:
-            print_card(run_dir, "auth", {**extra, "FIX": prov.login})
+            print_card(
+                run_dir,
+                "auth",
+                {
+                    **extra,
+                    "FIX": prov.login,
+                    "THEN": "peers doctor",
+                    "RETRY": "if doctor already showed this CLI ok, retry the same peer once — Cursor's login banner is not a logout",
+                },
+            )
         return 1, run_dir, "auth"
 
     argv = prov.argv(bin, model, prompt, args.force, args.agent)
@@ -862,6 +888,11 @@ def run_target(args: argparse.Namespace, task: str, *, silent: bool = False) -> 
         extra_out = dict(extra)
         if status == "auth":
             extra_out["FIX"] = prov.login
+            extra_out["THEN"] = "peers doctor"
+            extra_out["RETRY"] = (
+                "if doctor already showed this CLI ok, retry the same peer once "
+                "— Cursor's login banner is not a logout"
+            )
         print_card(run_dir, status, extra_out)
     if rc == 142:
         return 2, run_dir, status
@@ -1279,6 +1310,8 @@ def cmd_doctor() -> int:
     print()
     missing_backend = True
     oc_ok = False
+    cursor_ok = False
+    need_login: list[tuple[str, str]] = []
     with ThreadPoolExecutor(max_workers=6) as ex:
         futs = {ex.submit(P.probe, p): p for p in P.PROVIDERS.values() if p.find()}
         missing = [p for p in P.PROVIDERS.values() if not p.find()]
@@ -1294,8 +1327,12 @@ def cmd_doctor() -> int:
                 missing_backend = False
             if p.id == "opencode" and state == "ok":
                 oc_ok = True
+            if p.id == "cursor" and state == "ok":
+                cursor_ok = True
             if state == "auth":
-                print(f"     login      {p.login}")
+                need_login.append((p.id, p.login))
+                print(f"     run:       {p.login}")
+                print("     then:      peers doctor")
     print()
     ready = P.available_aliases(exclude_self=True, authed=True)
     print("ready      " + (", ".join(ready) or "(none)"))
@@ -1306,6 +1343,15 @@ def cmd_doctor() -> int:
         print("desk       " + ("+".join(desk) if desk else "(need an authenticated peer)"))
     if oc_ok:
         print("gateway    opencode /connect  →  peers zai | kimi | ollama | provider/model")
+    print()
+    print("login      peers has no account. AUTH means that CLI needs its own login")
+    print("           in a real terminal (not a sandbox), then: peers doctor")
+    if cursor_ok:
+        print("           Cursor ok. status may print 'Starting login process' — that is a banner, not a logout.")
+    if need_login:
+        print("           run:")
+        for pid, cmd in need_login:
+            print(f"             {cmd}")
     if missing_backend:
         print(f"{PROG}: no coding CLI on PATH. Install one, or: opencode /connect", file=sys.stderr)
         return 3

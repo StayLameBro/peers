@@ -77,3 +77,4 @@ fi
 
 "$BIN/peers" setup
 echo "Next:  peers doctor"
+echo "Login is per CLI (peers has no account). Cursor: cursor-agent login"
