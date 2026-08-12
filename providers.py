@@ -364,9 +364,10 @@ PROVIDERS: dict[str, Provider] = {
         hint="Cursor CLI — your Cursor plan. https://cursor.com/docs/cli",
         login="cursor-agent login",
         models={
-            "default": "grok-4.6",
-            "grok": "grok-4.6",
-            "grok-4.6": "grok-4.6",
+            "default": "cursor-grok-4.6-high",
+            "grok": "cursor-grok-4.6-high",
+            "grok-4.6": "cursor-grok-4.6-high",
+            "cursor-grok-4.6-high": "cursor-grok-4.6-high",
             "composer": "composer-2.5",
             "composer-2.5": "composer-2.5",
             "auto": "auto",
@@ -470,6 +471,7 @@ PROVIDERS: dict[str, Provider] = {
 ALIASES: dict[str, tuple[str, str]] = {
     "grok": ("cursor", "grok-4.6"),
     "grok-4.6": ("cursor", "grok-4.6"),
+    "cursor-grok-4.6-high": ("cursor", "grok-4.6"),
     "composer": ("cursor", "composer-2.5"),
     "cursor": ("cursor", "default"),
     "opus": ("claude", "opus"),
@@ -499,7 +501,10 @@ ALIASES: dict[str, tuple[str, str]] = {
 }
 
 SELF_ALIASES: dict[str, set[str]] = {
-    "cursor": {"cursor", "grok", "grok-4.6", "composer", "composer-2.5"},
+    "cursor": {
+        "cursor", "grok", "grok-4.6", "cursor-grok-4.6-high",
+        "composer", "composer-2.5",
+    },
     "claude": {"claude", "opus", "sonnet", "haiku", "fable"},
     "codex": {"codex", "gpt"},
     "gemini": {"gemini", "flash", "pro"},
